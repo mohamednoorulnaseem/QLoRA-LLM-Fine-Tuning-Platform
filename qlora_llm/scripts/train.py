@@ -1,31 +1,29 @@
+#!/usr/bin/env python3
 """
-QLoRA LLM Fine-Tuning Platform — Training Pipeline
-====================================================
-Author : Mohamed Noorul Naseem M
-Purpose: Fine-tune 7B+ LLMs using 4-bit QLoRA on consumer GPUs.
-Hardware: Optimized for NVIDIA RTX 4060 8GB VRAM
+train.py — QLoRA Training Pipeline for 7B+ LLMs
+=================================================
 
-Key Optimizations:
-    - NF4 4-bit quantization (BitsAndBytes)
-    - Double quantization for additional ~0.4 GB savings
-    - Gradient checkpointing (~30% VRAM reduction)
-    - Paged AdamW 8-bit optimizer (~2 GB VRAM savings)
-    - FP16 mixed precision training
-    - Batch size 2 + gradient accumulation = effective batch size 8
+End-to-end fine-tuning pipeline using:
+  • 4-bit NF4 quantization via bitsandbytes
+  • LoRA adapters via PEFT (r=16, α=32)
+  • SFTTrainer from TRL for supervised fine-tuning
+  • Paged AdamW optimizer (offloads optimizer states to CPU)
+  • Gradient checkpointing (~30% VRAM saved)
+  • fp16 mixed precision training
+
+Optimized for RTX 4060 8GB VRAM — peak usage ~6.5–7.5 GB.
 
 Usage:
-    python scripts/train.py \\
-        --model_name mistralai/Mistral-7B-Instruct-v0.2 \\
-        --dataset_path data/train.jsonl \\
-        --output_dir models/my-finetuned-model \\
-        --epochs 3 --batch_size 2 --lr 2e-4
+  python scripts/train.py \\
+    --model_name mistralai/Mistral-7B-Instruct-v0.2 \\
+    --dataset_path data/train.jsonl \\
+    --output_dir models/my-finetuned-model \\
+    --epochs 3 \\
+    --batch_size 2 \\
+    --lr 2e-4
 
-    # With W&B logging:
-    python scripts/train.py \\
-        --model_name mistralai/Mistral-7B-Instruct-v0.2 \\
-        --dataset_path data/train.jsonl \\
-        --output_dir models/my-finetuned-model \\
-        --use_wandb
+Author : Mohamed Noorul Naseem M
+Hardware: Lenovo LOQ | RTX 4060 8GB | i7-13650HX | 24GB RAM
 """
 
 import argparse
@@ -36,472 +34,364 @@ import time
 from pathlib import Path
 
 import torch
-from datasets import Dataset
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType,
-)
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    EarlyStoppingCallback,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
 )
 from trl import SFTTrainer
 
+console = Console()
 
-# ---------------------------------------------------------------------------
-# Constants & Defaults
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# ──────────────────────────── Defaults ────────────────────────────
 DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
-DEFAULT_DATASET = str(PROJECT_ROOT / "data" / "train.jsonl")
-DEFAULT_OUTPUT = str(PROJECT_ROOT / "models" / "qlora-mistral-7b")
+DEFAULT_DATASET = os.path.join("data", "train.jsonl")
+DEFAULT_OUTPUT = os.path.join("models", "qlora-mistral-7b")
 
-# RTX 4060-optimised defaults
-DEFAULT_BATCH_SIZE = 2
-DEFAULT_GRAD_ACCUM = 4
-DEFAULT_LR = 2e-4
-DEFAULT_EPOCHS = 3
-DEFAULT_MAX_SEQ_LEN = 1024          # 2048 possible but tight on 8 GB
-DEFAULT_LORA_R = 16
-DEFAULT_LORA_ALPHA = 32
-DEFAULT_LORA_DROPOUT = 0.05
-DEFAULT_WARMUP_RATIO = 0.03
-DEFAULT_WEIGHT_DECAY = 0.01
-DEFAULT_SAVE_STEPS = 100
-DEFAULT_LOGGING_STEPS = 10
-
-# LoRA target modules — works for Mistral / LLaMA / Gemma / Phi
-TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
+# LoRA Hyperparameters (Design Doc §4.2)
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Data Formatting
-# ---------------------------------------------------------------------------
-def format_instruction(sample: dict) -> str:
-    """
-    Format a single training sample into the instruction-following template.
-
-    Uses the Alpaca-style prompt format compatible with Mistral, LLaMA, Gemma:
-        ### Instruction:
-        {instruction}
-
-        ### Input:
-        {input}            ← only if non-empty
-
-        ### Response:
-        {output}
-    """
-    instruction = sample.get("instruction", "You are a helpful AI assistant.")
-    user_input = sample.get("input", "")
-    output = sample.get("output", "")
-
-    if user_input.strip():
-        text = (
-            f"### Instruction:\n{instruction}\n\n"
-            f"### Input:\n{user_input}\n\n"
-            f"### Response:\n{output}"
-        )
-    else:
-        text = (
-            f"### Instruction:\n{instruction}\n\n"
-            f"### Response:\n{output}"
-        )
-
-    return text
+# ──────────────────────────── Utilities ───────────────────────────
 
 
-def load_jsonl_dataset(path: str) -> Dataset:
-    """Load a JSONL file into a HuggingFace ``Dataset``."""
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-
-    dataset = Dataset.from_list(records)
-    print(f"📂 Loaded {len(dataset)} training samples from {path}")
-    return dataset
-
-
-# ---------------------------------------------------------------------------
-# Model Loading
-# ---------------------------------------------------------------------------
-def load_quantized_model(model_name: str):
-    """
-    Load a model in 4-bit NF4 quantization with double quantization.
-
-    Returns:
-        (model, tokenizer) tuple with the quantized model and its tokenizer.
-    """
-    print(f"\n🔧 Loading model: {model_name}")
-    print(f"   Quantization : NF4 4-bit + double quantization")
-    print(f"   Compute dtype: float16")
-
-    # --- BitsAndBytes 4-bit config ---
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",             # NormalFloat4 for better accuracy
-        bnb_4bit_compute_dtype=torch.float16,   # FP16 compute for speed
-        bnb_4bit_use_double_quant=True,         # Double quantization saves ~0.4 GB
-    )
-
-    # --- Load tokenizer ---
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # --- Load quantized model ---
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",                      # Auto-map layers to GPU/CPU
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        attn_implementation="eager",            # Fallback for compatibility
-    )
-
-    # Enable gradient checkpointing for VRAM savings
-    model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
-
-    # Print model size info
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"\n📊 Model loaded:")
-    print(f"   Total parameters   : {total:,}")
-    print(f"   Trainable (LoRA)   : {trainable:,}")
-    print(f"   Trainable %        : {100 * trainable / total:.4f}%")
-
-    return model, tokenizer
-
-
-# ---------------------------------------------------------------------------
-# LoRA Adapter Configuration
-# ---------------------------------------------------------------------------
-def create_lora_config(
-    r: int = DEFAULT_LORA_R,
-    lora_alpha: int = DEFAULT_LORA_ALPHA,
-    lora_dropout: float = DEFAULT_LORA_DROPOUT,
-) -> LoraConfig:
-    """Create a LoRA configuration targeting all attention + MLP projection layers."""
-    config = LoraConfig(
-        r=r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=TARGET_MODULES,
-    )
-
-    print(f"\n🔌 LoRA Config:")
-    print(f"   Rank (r)        : {r}")
-    print(f"   Alpha           : {lora_alpha}")
-    print(f"   Dropout         : {lora_dropout}")
-    print(f"   Target modules  : {TARGET_MODULES}")
-    return config
-
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-def train(
-    model_name: str,
-    dataset_path: str,
-    output_dir: str,
-    epochs: int = DEFAULT_EPOCHS,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    grad_accum: int = DEFAULT_GRAD_ACCUM,
-    lr: float = DEFAULT_LR,
-    max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
-    lora_r: int = DEFAULT_LORA_R,
-    lora_alpha: int = DEFAULT_LORA_ALPHA,
-    lora_dropout: float = DEFAULT_LORA_DROPOUT,
-    use_wandb: bool = False,
-    wandb_project: str = "qlora-finetune",
-    save_steps: int = DEFAULT_SAVE_STEPS,
-    logging_steps: int = DEFAULT_LOGGING_STEPS,
-    warmup_ratio: float = DEFAULT_WARMUP_RATIO,
-    weight_decay: float = DEFAULT_WEIGHT_DECAY,
-    seed: int = 42,
-):
-    """
-    Main training function: loads model, prepares data, trains with QLoRA,
-    and saves the adapter weights.
-    """
-    print("=" * 60)
-    print("🚀 QLoRA Fine-Tuning Pipeline")
-    print("=" * 60)
-    print(f"   Model           : {model_name}")
-    print(f"   Dataset         : {dataset_path}")
-    print(f"   Output          : {output_dir}")
-    print(f"   Epochs          : {epochs}")
-    print(f"   Batch size      : {batch_size}")
-    print(f"   Grad accum      : {grad_accum}")
-    print(f"   Effective batch : {batch_size * grad_accum}")
-    print(f"   Learning rate   : {lr}")
-    print(f"   Max seq len     : {max_seq_len}")
-    print(f"   Seed            : {seed}")
-    print(f"   W&B logging     : {use_wandb}")
-    print("=" * 60)
-
-    # --- GPU check ---
+def print_gpu_info():
+    """Display GPU information and current VRAM usage."""
     if not torch.cuda.is_available():
-        print("❌ CUDA not available. QLoRA requires a CUDA-capable GPU.")
+        console.print("[bold red]❌ CUDA is NOT available! Training requires a CUDA GPU.[/]")
         sys.exit(1)
 
     gpu_name = torch.cuda.get_device_name(0)
-    gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
-    print(f"\n🖥️  GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+    total_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+    current_mem = torch.cuda.memory_allocated(0) / 1e9
+    reserved_mem = torch.cuda.memory_reserved(0) / 1e9
 
-    # --- Load model & tokenizer ---
-    model, tokenizer = load_quantized_model(model_name)
+    table = Table(title="🖥️ GPU Information", show_header=False)
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="bold")
+    table.add_row("GPU", gpu_name)
+    table.add_row("Total VRAM", f"{total_mem:.1f} GB")
+    table.add_row("Allocated", f"{current_mem:.2f} GB")
+    table.add_row("Reserved", f"{reserved_mem:.2f} GB")
+    table.add_row("CUDA version", torch.version.cuda or "N/A")
+    table.add_row("PyTorch version", torch.__version__)
+    console.print(table)
 
-    # --- Apply LoRA ---
-    lora_config = create_lora_config(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
+
+def format_prompt(sample: dict) -> str:
+    """
+    Format a dataset sample into Mistral instruct template.
+
+    Template:  <s>[INST] {instruction}\n\n{input} [/INST] {output}</s>
+    """
+    instruction = sample.get("instruction", "You are a helpful assistant.")
+    user_input = sample.get("input", "")
+    output = sample.get("output", "")
+
+    prompt = f"<s>[INST] {instruction}\n\n{user_input} [/INST] {output}</s>"
+    return prompt
+
+
+def load_jsonl_dataset(filepath: str, test_size: float = 0.1, seed: int = 42):
+    """
+    Load a JSONL file into a HuggingFace DatasetDict with train/eval split.
+
+    Args:
+        filepath: Path to the JSONL file.
+        test_size: Fraction for evaluation split (default: 10%).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        DatasetDict with 'train' and 'test' splits.
+    """
+    if not os.path.exists(filepath):
+        console.print(f"[bold red]❌ Dataset not found: {filepath}[/]")
+        console.print("   Run `python scripts/prepare_data.py` first to generate sample data.")
+        sys.exit(1)
+
+    dataset = load_dataset("json", data_files=filepath, split="train")
+    console.print(f"📂 Loaded [bold]{len(dataset)}[/] samples from [cyan]{filepath}[/]")
+
+    # Split into train / eval
+    dataset_split = dataset.train_test_split(test_size=test_size, seed=seed)
+    console.print(
+        f"   Train: [green]{len(dataset_split['train'])}[/] | "
+        f"Eval: [yellow]{len(dataset_split['test'])}[/] "
+        f"(split: {1 - test_size:.0%} / {test_size:.0%})"
     )
-    model = get_peft_model(model, lora_config)
+    return dataset_split
 
-    # Recount trainable params after LoRA
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"\n🔌 LoRA applied:")
-    print(f"   Trainable params : {trainable:,}")
-    print(f"   Trainable %      : {100 * trainable / total:.4f}%")
 
-    # --- Load dataset ---
-    dataset = load_jsonl_dataset(dataset_path)
+# ──────────────────────────── Main Training ───────────────────────
 
-    # --- W&B setup ---
-    report_to = "none"
-    if use_wandb:
-        try:
-            import wandb
-            report_to = "wandb"
-            wandb.init(project=wandb_project, config={
-                "model_name": model_name,
-                "lora_r": lora_r,
-                "lora_alpha": lora_alpha,
-                "lr": lr,
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "max_seq_len": max_seq_len,
-            })
-            print("📊 W&B logging enabled")
-        except Exception as e:
-            print(f"⚠️  W&B init failed: {e}")
-            print("   Continuing without W&B...")
-            report_to = "none"
 
-    # --- Training arguments ---
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
-        lr_scheduler_type="cosine",
-        fp16=True,                                  # FP16 mixed precision
-        bf16=False,                                 # RTX 4060 supports bf16 too
-        logging_steps=logging_steps,
-        save_steps=save_steps,
-        save_total_limit=3,                         # Keep only last 3 checkpoints
-        optim="paged_adamw_8bit",                   # Paged optimizer saves ~2 GB VRAM
-        gradient_checkpointing=True,
-        max_grad_norm=0.3,
-        report_to=report_to,
-        seed=seed,
-        dataloader_pin_memory=True,
-        remove_unused_columns=False,
-        group_by_length=True,                       # Group similar-length samples
-    )
-
-    # --- Trainer ---
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset,
-        args=training_args,
-        max_seq_length=max_seq_len,
-        formatting_func=format_instruction,
-        packing=False,                              # No packing for instruction data
-        dataset_text_field=None,
-    )
-
-    # --- Train ---
-    print("\n🏋️ Starting training...")
+def train(args):
+    """Execute the full QLoRA training pipeline."""
     start_time = time.time()
 
-    train_result = trainer.train()
+    console.print(Panel(
+        "[bold cyan]🚀 QLoRA Fine-Tuning Pipeline[/]\n"
+        f"Model: [white]{args.model_name}[/]\n"
+        f"Dataset: [white]{args.dataset_path}[/]\n"
+        f"Output: [white]{args.output_dir}[/]",
+        title="Training Configuration",
+        border_style="cyan",
+    ))
 
+    print_gpu_info()
+
+    # ── 1. Load dataset ──
+    console.print("\n[bold]📂 Step 1: Loading dataset...[/]")
+    dataset = load_jsonl_dataset(args.dataset_path, seed=args.seed)
+
+    # ── 2. Configure quantization ──
+    console.print("\n[bold]⚙️ Step 2: Configuring 4-bit quantization...[/]")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,  # Saves ~0.4GB extra VRAM
+    )
+
+    console.print("   ✅ NF4 4-bit quantization + double quantization enabled")
+
+    # ── 3. Load tokenizer ──
+    console.print("\n[bold]📝 Step 3: Loading tokenizer...[/]")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        trust_remote_code=True,
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    console.print(f"   Tokenizer loaded: vocab_size={tokenizer.vocab_size}")
+
+    # ── 4. Load base model ──
+    console.print(f"\n[bold]🧠 Step 4: Loading base model ({args.model_name})...[/]")
+    console.print("   [dim]This will download ~14GB on first run...[/]")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+    )
+
+    # Enable gradient checkpointing (saves ~30% VRAM)
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(model)
+
+    # Print VRAM after model load
+    mem_used = torch.cuda.memory_allocated(0) / 1e9
+    console.print(f"   ✅ Model loaded — VRAM used: [bold]{mem_used:.2f} GB[/]")
+
+    # ── 5. Configure LoRA ──
+    console.print("\n[bold]🔧 Step 5: Injecting LoRA adapters...[/]")
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    # Print trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_pct = trainable_params / total_params * 100
+
+    table = Table(title="🔧 LoRA Configuration", show_header=False)
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="bold")
+    table.add_row("Rank (r)", str(args.lora_r))
+    table.add_row("Alpha (α)", str(args.lora_alpha))
+    table.add_row("Dropout", str(LORA_DROPOUT))
+    table.add_row("Target modules", ", ".join(LORA_TARGET_MODULES))
+    table.add_row("Trainable params", f"{trainable_params:,}")
+    table.add_row("Total params", f"{total_params:,}")
+    table.add_row("Trainable %", f"{trainable_pct:.4f}%")
+    console.print(table)
+
+    # ── 6. Training arguments ──
+    console.print("\n[bold]🏋️ Step 6: Configuring training arguments...[/]")
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        weight_decay=0.01,
+        optim="paged_adamw_32bit",
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        fp16=True,
+        bf16=False,
+        max_grad_norm=0.3,
+        logging_steps=10,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        eval_strategy="steps",
+        eval_steps=args.save_steps,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        max_steps=-1,
+        group_by_length=True,
+        report_to="wandb" if args.use_wandb else "tensorboard",
+        seed=args.seed,
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+    )
+
+    # ── 7. Initialize trainer ──
+    console.print("\n[bold]🚂 Step 7: Initializing SFTTrainer...[/]")
+
+    callbacks = []
+    if args.early_stopping:
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args.patience,
+            early_stopping_threshold=0.01,
+        ))
+        console.print(f"   Early stopping enabled (patience={args.patience})")
+
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["test"],
+        tokenizer=tokenizer,
+        formatting_func=format_prompt,
+        max_seq_length=args.max_seq_len,
+        callbacks=callbacks,
+    )
+
+    # ── 8. Train! ──
+    console.print("\n" + "=" * 60)
+    console.print("[bold green]🚀 Starting training...[/]")
+    console.print("=" * 60 + "\n")
+
+    mem_before = torch.cuda.memory_allocated(0) / 1e9
+    trainer.train()
+    mem_after = torch.cuda.max_memory_allocated(0) / 1e9
+
+    # ── 9. Save the final adapter ──
+    adapter_save_path = os.path.join(args.output_dir, "final_adapter")
+    trainer.save_model(adapter_save_path)
+    tokenizer.save_pretrained(adapter_save_path)
+    console.print(f"\n✅ [bold green]Final adapter saved[/] → [cyan]{adapter_save_path}[/]")
+
+    # ── 10. Training summary ──
     elapsed = time.time() - start_time
-    hours, rem = divmod(elapsed, 3600)
-    mins, secs = divmod(rem, 60)
-    print(f"\n⏱️  Training completed in {int(hours)}h {int(mins)}m {int(secs)}s")
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = int(elapsed % 60)
 
-    # --- Log metrics ---
-    metrics = train_result.metrics
-    print(f"\n📊 Training Metrics:")
-    for k, v in metrics.items():
-        print(f"   {k}: {v}")
+    summary = Table(title="📊 Training Summary", show_header=False)
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Value", style="bold")
+    summary.add_row("Total time", f"{hours}h {minutes}m {seconds}s")
+    summary.add_row("Peak VRAM", f"{mem_after:.2f} GB")
+    summary.add_row("VRAM before training", f"{mem_before:.2f} GB")
+    summary.add_row("Final train loss", f"{trainer.state.log_history[-1].get('train_loss', 'N/A')}")
+    summary.add_row("Adapter path", adapter_save_path)
+    summary.add_row("Epochs", str(args.epochs))
+    summary.add_row("Batch size", f"{args.batch_size} (× {args.grad_accum} accum)")
+    summary.add_row("Learning rate", str(args.lr))
+    console.print(summary)
 
-    # --- Save final adapter ---
-    final_adapter_dir = os.path.join(output_dir, "final_adapter")
-    model.save_pretrained(final_adapter_dir)
-    tokenizer.save_pretrained(final_adapter_dir)
-    print(f"\n💾 Final adapter saved → {final_adapter_dir}")
-
-    # --- Save training config ---
-    config_path = os.path.join(output_dir, "training_config.json")
-    training_config = {
-        "model_name": model_name,
-        "dataset_path": dataset_path,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "grad_accum": grad_accum,
-        "effective_batch_size": batch_size * grad_accum,
-        "lr": lr,
-        "max_seq_len": max_seq_len,
-        "lora_r": lora_r,
-        "lora_alpha": lora_alpha,
-        "lora_dropout": lora_dropout,
+    # Save config as JSON
+    config_path = os.path.join(args.output_dir, "training_config.json")
+    config = {
+        "model_name": args.model_name,
+        "dataset_path": args.dataset_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "learning_rate": args.lr,
+        "max_seq_len": args.max_seq_len,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": LORA_DROPOUT,
+        "target_modules": LORA_TARGET_MODULES,
+        "peak_vram_gb": round(mem_after, 2),
         "training_time_seconds": round(elapsed, 2),
-        "final_metrics": metrics,
-        "gpu": gpu_name,
+        "seed": args.seed,
     }
     with open(config_path, "w") as f:
-        json.dump(training_config, f, indent=2, default=str)
-    print(f"📝 Training config saved → {config_path}")
+        json.dump(config, f, indent=2)
+    console.print(f"   Config saved → [cyan]{config_path}[/]")
 
-    # --- Cleanup ---
-    if use_wandb and report_to == "wandb":
-        try:
-            wandb.finish()
-        except Exception:
-            pass
-
-    print("\n✅ Training pipeline complete!")
-    print(f"   Adapter location: {final_adapter_dir}")
-    print(f"   Next step: python scripts/inference.py --adapter_path {final_adapter_dir}")
-
-    return trainer
+    console.print("\n[bold green]✅ Training complete![/] 🎉\n")
 
 
-# ---------------------------------------------------------------------------
-# CLI Entry Point
-# ---------------------------------------------------------------------------
+# ──────────────────────────── CLI ─────────────────────────────────
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="QLoRA Fine-Tuning Pipeline — 7B LLMs on RTX 4060",
+        description="QLoRA Fine-Tuning Pipeline — Train 7B LLMs on RTX 4060",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic training with Mistral-7B
-  python scripts/train.py \\
-      --model_name mistralai/Mistral-7B-Instruct-v0.2 \\
-      --dataset_path data/train.jsonl \\
-      --output_dir models/my-model \\
-      --epochs 3 --batch_size 2 --lr 2e-4
-
-  # LLaMA-3 8B (needs HF login)
-  python scripts/train.py \\
-      --model_name meta-llama/Meta-Llama-3-8B-Instruct
-
-  # With W&B logging
-  python scripts/train.py --use_wandb
-
-  # Low-VRAM mode
-  python scripts/train.py --batch_size 1 --max_seq_len 512
-        """,
     )
 
-    # Model & data
-    parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL,
-                        help=f"HuggingFace model ID (default: {DEFAULT_MODEL})")
-    parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET,
+    # Core arguments
+    parser.add_argument("--model_name", default=DEFAULT_MODEL,
+                        help=f"Base model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--dataset_path", default=DEFAULT_DATASET,
                         help=f"Path to training JSONL (default: {DEFAULT_DATASET})")
-    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT,
-                        help=f"Output directory (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT,
+                        help=f"Output directory for checkpoints (default: {DEFAULT_OUTPUT})")
 
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                        help=f"Training epochs (default: {DEFAULT_EPOCHS})")
-    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE,
-                        help=f"Per-device batch size (default: {DEFAULT_BATCH_SIZE})")
-    parser.add_argument("--grad_accum", type=int, default=DEFAULT_GRAD_ACCUM,
-                        help=f"Gradient accumulation steps (default: {DEFAULT_GRAD_ACCUM})")
-    parser.add_argument("--lr", type=float, default=DEFAULT_LR,
-                        help=f"Learning rate (default: {DEFAULT_LR})")
-    parser.add_argument("--max_seq_len", type=int, default=DEFAULT_MAX_SEQ_LEN,
-                        help=f"Max sequence length (default: {DEFAULT_MAX_SEQ_LEN})")
-    parser.add_argument("--warmup_ratio", type=float, default=DEFAULT_WARMUP_RATIO,
-                        help=f"Warmup ratio (default: {DEFAULT_WARMUP_RATIO})")
-    parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY,
-                        help=f"Weight decay (default: {DEFAULT_WEIGHT_DECAY})")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--epochs", type=int, default=3,
+                        help="Number of training epochs (default: 3)")
+    parser.add_argument("--batch_size", type=int, default=2,
+                        help="Per-device batch size (default: 2)")
+    parser.add_argument("--grad_accum", type=int, default=4,
+                        help="Gradient accumulation steps (default: 4)")
+    parser.add_argument("--lr", type=float, default=2e-4,
+                        help="Learning rate (default: 2e-4)")
+    parser.add_argument("--max_seq_len", type=int, default=2048,
+                        help="Maximum sequence length (default: 2048)")
 
-    # LoRA hyperparameters
-    parser.add_argument("--lora_r", type=int, default=DEFAULT_LORA_R,
-                        help=f"LoRA rank (default: {DEFAULT_LORA_R})")
-    parser.add_argument("--lora_alpha", type=int, default=DEFAULT_LORA_ALPHA,
-                        help=f"LoRA alpha (default: {DEFAULT_LORA_ALPHA})")
-    parser.add_argument("--lora_dropout", type=float, default=DEFAULT_LORA_DROPOUT,
-                        help=f"LoRA dropout (default: {DEFAULT_LORA_DROPOUT})")
+    # LoRA config
+    parser.add_argument("--lora_r", type=int, default=LORA_R,
+                        help=f"LoRA rank (default: {LORA_R})")
+    parser.add_argument("--lora_alpha", type=int, default=LORA_ALPHA,
+                        help=f"LoRA alpha (default: {LORA_ALPHA})")
 
-    # Logging
+    # Training options
+    parser.add_argument("--save_steps", type=int, default=50,
+                        help="Save checkpoint every N steps (default: 50)")
+    parser.add_argument("--early_stopping", action="store_true", default=True,
+                        help="Enable early stopping (default: True)")
+    parser.add_argument("--patience", type=int, default=3,
+                        help="Early stopping patience (default: 3)")
     parser.add_argument("--use_wandb", action="store_true",
-                        help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="qlora-finetune",
-                        help="W&B project name")
-    parser.add_argument("--save_steps", type=int, default=DEFAULT_SAVE_STEPS,
-                        help=f"Save checkpoint every N steps (default: {DEFAULT_SAVE_STEPS})")
-    parser.add_argument("--logging_steps", type=int, default=DEFAULT_LOGGING_STEPS,
-                        help=f"Log every N steps (default: {DEFAULT_LOGGING_STEPS})")
+                        help="Use Weights & Biases for logging (default: TensorBoard)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42)")
 
     args = parser.parse_args()
-
-    train(
-        model_name=args.model_name,
-        dataset_path=args.dataset_path,
-        output_dir=args.output_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        grad_accum=args.grad_accum,
-        lr=args.lr,
-        max_seq_len=args.max_seq_len,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        use_wandb=args.use_wandb,
-        wandb_project=args.wandb_project,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        seed=args.seed,
-    )
+    train(args)
 
 
 if __name__ == "__main__":

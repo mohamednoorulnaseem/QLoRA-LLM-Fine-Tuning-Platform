@@ -1,121 +1,117 @@
 {
+  "description": "Benchmark prompts for qualitative evaluation of fine-tuned QLoRA models",
   "version": "1.0",
-  "description": "Benchmark prompts for QLoRA fine-tuned model evaluation",
-  "author": "Mohamed Noorul Naseem M",
+  "model_defaults": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.9
+  },
   "prompts": [
     {
       "id": "general_01",
-      "category": "general",
-      "prompt": "Explain the transformer architecture in simple terms.",
+      "category": "general_knowledge",
+      "prompt": "Explain the concept of machine learning in simple terms that a high school student would understand.",
       "expected_keywords": [
-        "attention",
-        "encoder",
-        "decoder",
-        "self-attention",
-        "tokens"
+        "data",
+        "patterns",
+        "learn",
+        "predict",
+        "algorithm"
       ],
-      "max_new_tokens": 256
+      "min_output_tokens": 50
     },
     {
       "id": "general_02",
-      "category": "general",
-      "prompt": "What are the key differences between supervised and unsupervised learning?",
+      "category": "general_knowledge",
+      "prompt": "What is the difference between supervised and unsupervised learning?",
       "expected_keywords": [
         "labeled",
         "unlabeled",
         "classification",
         "clustering",
-        "regression"
+        "training"
       ],
-      "max_new_tokens": 256
+      "min_output_tokens": 50
     },
     {
-      "id": "general_03",
-      "category": "general",
-      "prompt": "Describe the concept of transfer learning and why it is useful.",
+      "id": "technical_01",
+      "category": "technical",
+      "prompt": "Describe how a transformer architecture processes input text step by step.",
       "expected_keywords": [
-        "pretrained",
-        "fine-tune",
-        "domain",
-        "features",
-        "generalization"
+        "attention",
+        "embedding",
+        "encoder",
+        "decoder",
+        "token"
       ],
-      "max_new_tokens": 256
+      "min_output_tokens": 80
     },
     {
-      "id": "qlora_01",
-      "category": "qlora",
-      "prompt": "What is QLoRA and how does it enable fine-tuning large models on consumer GPUs?",
+      "id": "technical_02",
+      "category": "technical",
+      "prompt": "What is quantization in the context of large language models, and why is it useful?",
       "expected_keywords": [
-        "quantization",
-        "4-bit",
-        "LoRA",
-        "adapter",
-        "VRAM",
-        "memory"
+        "precision",
+        "memory",
+        "inference",
+        "bit",
+        "weight"
       ],
-      "max_new_tokens": 300
-    },
-    {
-      "id": "qlora_02",
-      "category": "qlora",
-      "prompt": "Explain the difference between full fine-tuning, LoRA, and QLoRA.",
-      "expected_keywords": [
-        "parameters",
-        "rank",
-        "quantized",
-        "adapter",
-        "efficient"
-      ],
-      "max_new_tokens": 300
-    },
-    {
-      "id": "code_01",
-      "category": "code",
-      "prompt": "Write a Python function that calculates the Fibonacci sequence using dynamic programming.",
-      "expected_keywords": ["def", "fibonacci", "return", "for", "range"],
-      "max_new_tokens": 300
-    },
-    {
-      "id": "code_02",
-      "category": "code",
-      "prompt": "Explain how a hash map works internally and its average time complexity.",
-      "expected_keywords": ["hash", "bucket", "collision", "O(1)", "key"],
-      "max_new_tokens": 256
-    },
-    {
-      "id": "medical_01",
-      "category": "medical",
-      "prompt": "What are the common symptoms and treatment options for Type 2 diabetes?",
-      "expected_keywords": [
-        "insulin",
-        "blood sugar",
-        "glucose",
-        "diet",
-        "medication"
-      ],
-      "max_new_tokens": 300
+      "min_output_tokens": 60
     },
     {
       "id": "reasoning_01",
       "category": "reasoning",
-      "prompt": "A farmer has 3 fields. Field A produces 200 kg of wheat, Field B produces 150 kg, and Field C produces 250 kg. If he sells wheat at $2 per kg, what is his total revenue?",
-      "expected_keywords": ["600", "1200", "total", "revenue"],
-      "max_new_tokens": 200
+      "prompt": "A company has 100 employees. 60% work remotely, 30% work in-office, and the rest are hybrid. How many hybrid employees are there?",
+      "expected_keywords": ["10", "hybrid", "100"],
+      "min_output_tokens": 20
+    },
+    {
+      "id": "reasoning_02",
+      "category": "reasoning",
+      "prompt": "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
+      "expected_keywords": ["5", "minutes"],
+      "min_output_tokens": 20
     },
     {
       "id": "creative_01",
       "category": "creative",
-      "prompt": "Write a short poem about artificial intelligence and the future of humanity.",
-      "expected_keywords": ["AI", "future", "machine", "human"],
-      "max_new_tokens": 200
+      "prompt": "Write a short poem about artificial intelligence and nature.",
+      "expected_keywords": ["AI", "nature", "learn"],
+      "min_output_tokens": 30
+    },
+    {
+      "id": "domain_01",
+      "category": "domain_specific",
+      "prompt": "What is QLoRA and how does it enable fine-tuning large language models on consumer GPUs?",
+      "expected_keywords": [
+        "quantization",
+        "LoRA",
+        "4-bit",
+        "VRAM",
+        "fine-tuning"
+      ],
+      "min_output_tokens": 60
+    },
+    {
+      "id": "domain_02",
+      "category": "domain_specific",
+      "prompt": "Explain the role of LoRA adapters in parameter-efficient fine-tuning.",
+      "expected_keywords": [
+        "low-rank",
+        "adapter",
+        "parameter",
+        "frozen",
+        "trainable"
+      ],
+      "min_output_tokens": 50
+    },
+    {
+      "id": "instruction_01",
+      "category": "instruction_following",
+      "prompt": "List exactly 5 benefits of using open-source LLMs over closed-source APIs. Number each benefit.",
+      "expected_keywords": ["1", "2", "3", "4", "5"],
+      "min_output_tokens": 50
     }
-  ],
-  "evaluation_settings": {
-    "temperature": 0.1,
-    "top_p": 0.9,
-    "repetition_penalty": 1.15,
-    "do_sample": false,
-    "num_return_sequences": 1
-  }
+  ]
 }

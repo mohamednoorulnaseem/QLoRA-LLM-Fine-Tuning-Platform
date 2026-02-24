@@ -1,83 +1,55 @@
-# ============================================================
+# ──────────────────────────────────────────────
 # QLoRA LLM Fine-Tuning Platform — .gitignore
-# ============================================================
+# ──────────────────────────────────────────────
 
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.egg
 *.egg-info/
 dist/
 build/
-*.whl
+*.egg
 
-# --- Virtual Environment ---
+# Virtual environments
 venv/
-env/
 .venv/
-.env/
+env/
 
-# --- IDE ---
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-.DS_Store
-Thumbs.db
 
-# --- ML / Model Artifacts ---
-# Downloaded base models (large, ~14GB each)
-qlora_llm/models/*/
-!qlora_llm/models/.gitkeep
-
-# Training checkpoints (can be huge)
-checkpoint-*/
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.gguf
-
-# --- Training Data ---
-# Generated / downloaded datasets (keep .gitkeep)
+# Data (large files)
 qlora_llm/data/*.jsonl
-qlora_llm/data/*.json
 qlora_llm/data/*.csv
 !qlora_llm/data/.gitkeep
 
-# --- Experiment Tracking ---
+# Models (large files — tracked via DVC or HF Hub)
+qlora_llm/models/*/
+!qlora_llm/models/.gitkeep
+
+# Logs
+*.log
 wandb/
 runs/
 tensorboard/
-*.tfevents*
 
-# --- Logs ---
-*.log
-logs/
-nohup.out
-
-# --- Secrets ---
-.env
-*.key
-*.pem
-token.txt
-
-# --- Jupyter ---
-.ipynb_checkpoints/
-*.ipynb
-
-# --- OS ---
+# OS
 .DS_Store
 Thumbs.db
 desktop.ini
-$RECYCLE.BIN/
 
-# --- Miscellaneous ---
-*.tmp
-*.bak
-*.orig
-.cache/
-huggingface/
+# Environment variables
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Evaluation results (regenerated)
+eval_results.json

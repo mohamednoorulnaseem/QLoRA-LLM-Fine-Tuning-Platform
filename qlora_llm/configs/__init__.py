@@ -1,1 +1,1 @@
-"""QLoRA LLM configs — benchmark prompts and model configurations."""
+# QLoRA LLM Fine-Tuning Platform — Configs Package

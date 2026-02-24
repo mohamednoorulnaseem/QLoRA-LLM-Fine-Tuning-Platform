@@ -1,62 +1,70 @@
+#!/usr/bin/env python3
 """
-QLoRA LLM Fine-Tuning Platform — Evaluation Suite
-===================================================
-Author : Mohamed Noorul Naseem M
-Purpose: Evaluate fine-tuned QLoRA models with multiple metrics:
-         1. Perplexity — language modeling quality
-         2. ROUGE scores — response similarity to references
-         3. Inference speed — tokens/sec throughput
-         4. Benchmark prompts — keyword-match scoring
-Hardware: Optimized for NVIDIA RTX 4060 8GB VRAM
+evaluate.py — Evaluation Suite for QLoRA Fine-Tuned Models
+============================================================
+
+Evaluation metrics:
+  • Perplexity       — exp(mean NLL) on held-out eval data (lower = better)
+  • ROUGE scores     — ROUGE-1, ROUGE-2, ROUGE-L F1 for generation quality
+  • Speed benchmark  — Tokens/second averaged over 3 runs with GPU warmup
+  • Benchmark prompts — JSON-driven qualitative eval with keyword matching
+  • VRAM reporting   — Current GPU memory usage stats
 
 Usage:
-    python scripts/evaluate.py \\
-        --base_model mistralai/Mistral-7B-Instruct-v0.2 \\
-        --adapter_path models/my-finetuned-model/final_adapter \\
-        --eval_data data/train.jsonl
+  python scripts/evaluate.py \\
+    --base_model mistralai/Mistral-7B-Instruct-v0.2 \\
+    --adapter_path models/my-model/final_adapter \\
+    --eval_data data/train.jsonl
 
-    # Benchmark prompts only
-    python scripts/evaluate.py \\
-        --adapter_path models/my-model/final_adapter \\
-        --benchmark_only
+Author : Mohamed Noorul Naseem M
+Hardware: Lenovo LOQ | RTX 4060 8GB | i7-13650HX | 24GB RAM
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 from peft import PeftModel
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
 )
 
+console = Console()
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
-DEFAULT_EVAL_DATA = str(PROJECT_ROOT / "data" / "train.jsonl")
-DEFAULT_BENCHMARK = str(PROJECT_ROOT / "configs" / "benchmark_prompts.json")
-DEFAULT_MAX_SAMPLES = 100  # Max samples for perplexity evaluation
+# ──────────────────────────── Defaults ────────────────────────────
+DEFAULT_BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+DEFAULT_ADAPTER = os.path.join("models", "qlora-mistral-7b", "final_adapter")
+DEFAULT_EVAL_DATA = os.path.join("data", "train.jsonl")
+BENCHMARK_PROMPTS_PATH = os.path.join("configs", "benchmark_prompts.json")
 
 
-# ---------------------------------------------------------------------------
-# Model Loading (identical to inference.py for consistency)
-# ---------------------------------------------------------------------------
-def load_model(base_model: str, adapter_path: str = None):
-    """Load a quantized model with optional LoRA adapter for evaluation."""
-    print(f"\n🔧 Loading model: {base_model}")
-    if adapter_path:
-        print(f"   Adapter: {adapter_path}")
+# ──────────────────────────── Model Loading ───────────────────────
+
+
+def load_model_for_eval(base_model: str, adapter_path: Optional[str] = None):
+    """
+    Load the model in 4-bit for evaluation.
+
+    Args:
+        base_model: HuggingFace model ID or local path.
+        adapter_path: Path to LoRA adapter directory.
+
+    Returns:
+        Tuple of (model, tokenizer).
+    """
+    console.print(f"\n⏳ Loading model for evaluation: [bold]{base_model}[/]")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -66,12 +74,10 @@ def load_model(base_model: str, adapter_path: str = None):
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        adapter_path or base_model,
+        adapter_path if adapter_path and os.path.exists(os.path.join(adapter_path, "tokenizer_config.json")) else base_model,
         trust_remote_code=True,
     )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -79,85 +85,76 @@ def load_model(base_model: str, adapter_path: str = None):
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.float16,
-        attn_implementation="eager",
     )
 
     if adapter_path and os.path.exists(adapter_path):
+        console.print(f"🔗 Loading LoRA adapter: [cyan]{adapter_path}[/]")
         model = PeftModel.from_pretrained(model, adapter_path)
-        print("   ✅ LoRA adapter merged")
+        model = model.merge_and_unload()
+        console.print("   ✅ Adapter merged for evaluation")
+    elif adapter_path:
+        console.print(f"[yellow]⚠ Adapter not found: {adapter_path} — evaluating base model[/]")
 
     model.eval()
-    print("   ✅ Model loaded & ready for evaluation\n")
+    mem = torch.cuda.memory_allocated(0) / 1e9
+    console.print(f"   📊 VRAM usage: [bold]{mem:.2f} GB[/]\n")
+
     return model, tokenizer
 
 
-# ---------------------------------------------------------------------------
-# Metric 1: Perplexity
-# ---------------------------------------------------------------------------
-def evaluate_perplexity(
+# ──────────────────────────── Perplexity ──────────────────────────
+
+
+def compute_perplexity(
     model,
     tokenizer,
     eval_data_path: str,
-    max_samples: int = DEFAULT_MAX_SAMPLES,
-    max_length: int = 1024,
-) -> dict:
+    max_samples: int = 100,
+    max_length: int = 2048,
+) -> float:
     """
-    Compute perplexity on an evaluation JSONL dataset.
+    Compute perplexity on evaluation data.
 
-    Perplexity = exp(average cross-entropy loss).
-    Lower is better. A well fine-tuned model should have perplexity < 5.0.
+    Perplexity = exp(mean negative log-likelihood) — lower is better.
 
     Args:
-        model:          The loaded model.
-        tokenizer:      The corresponding tokenizer.
-        eval_data_path: Path to evaluation JSONL file.
-        max_samples:    Maximum number of samples to evaluate.
-        max_length:     Maximum token length per sample.
+        model: The loaded language model.
+        tokenizer: The loaded tokenizer.
+        eval_data_path: Path to JSONL evaluation data.
+        max_samples: Maximum number of samples to evaluate.
+        max_length: Maximum token length per sample.
 
     Returns:
-        Dictionary with perplexity stats.
+        Perplexity score (float).
     """
-    print("=" * 60)
-    print("📊 Evaluating: PERPLEXITY")
-    print("=" * 60)
+    console.print("[bold]📊 Computing Perplexity...[/]")
 
-    # Load evaluation data
+    if not os.path.exists(eval_data_path):
+        console.print(f"[bold red]❌ Eval data not found: {eval_data_path}[/]")
+        return float("inf")
+
+    # Load eval samples
     samples = []
     with open(eval_data_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                record = json.loads(line)
-                # Format as instruction-response pair
-                instruction = record.get("instruction", "")
-                user_input = record.get("input", "")
-                output = record.get("output", "")
+                try:
+                    samples.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
 
-                if user_input.strip():
-                    text = (
-                        f"### Instruction:\n{instruction}\n\n"
-                        f"### Input:\n{user_input}\n\n"
-                        f"### Response:\n{output}"
-                    )
-                else:
-                    text = (
-                        f"### Instruction:\n{instruction}\n\n"
-                        f"### Response:\n{output}"
-                    )
-                samples.append(text)
-
-            if len(samples) >= max_samples:
-                break
-
-    print(f"   Evaluating {len(samples)} samples...")
+    samples = samples[:max_samples]
+    console.print(f"   Evaluating on {len(samples)} samples...")
 
     total_loss = 0.0
     total_tokens = 0
-    per_sample_ppl = []
 
     with torch.no_grad():
-        for i, text in enumerate(samples):
-            # Tokenize
+        for sample in tqdm(samples, desc="   Perplexity"):
+            # Format as Mistral instruct
+            text = f"<s>[INST] {sample.get('instruction', '')}\n\n{sample.get('input', '')} [/INST] {sample.get('output', '')}</s>"
+
             encodings = tokenizer(
                 text,
                 return_tensors="pt",
@@ -166,618 +163,478 @@ def evaluate_perplexity(
             ).to(model.device)
 
             input_ids = encodings["input_ids"]
-            seq_len = input_ids.shape[1]
+            target_ids = input_ids.clone()
 
-            if seq_len < 2:
-                continue
+            outputs = model(input_ids, labels=target_ids)
+            loss = outputs.loss
 
-            # Forward pass
-            outputs = model(input_ids=input_ids, labels=input_ids)
-            loss = outputs.loss.item()
+            num_tokens = input_ids.size(1)
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
 
-            total_loss += loss * (seq_len - 1)  # Weight by token count
-            total_tokens += seq_len - 1
-            per_sample_ppl.append(math.exp(loss))
+    if total_tokens == 0:
+        return float("inf")
 
-            if (i + 1) % 20 == 0:
-                running_ppl = math.exp(total_loss / total_tokens) if total_tokens > 0 else float("inf")
-                print(f"   [{i + 1}/{len(samples)}] Running perplexity: {running_ppl:.4f}")
+    avg_loss = total_loss / total_tokens
+    perplexity = np.exp(avg_loss)
 
-    # Final computation
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
-    perplexity = math.exp(avg_loss)
-    min_ppl = min(per_sample_ppl) if per_sample_ppl else float("inf")
-    max_ppl = max(per_sample_ppl) if per_sample_ppl else float("inf")
-    median_ppl = sorted(per_sample_ppl)[len(per_sample_ppl) // 2] if per_sample_ppl else float("inf")
+    color = "green" if perplexity < 5.0 else "yellow" if perplexity < 10.0 else "red"
+    console.print(f"   Perplexity: [{color}]{perplexity:.4f}[/] (target: < 5.0)\n")
 
-    result = {
-        "perplexity": round(perplexity, 4),
-        "min_perplexity": round(min_ppl, 4),
-        "max_perplexity": round(max_ppl, 4),
-        "median_perplexity": round(median_ppl, 4),
-        "total_tokens_evaluated": total_tokens,
-        "samples_evaluated": len(per_sample_ppl),
-    }
-
-    print(f"\n   📈 Results:")
-    print(f"   Perplexity (avg) : {result['perplexity']}")
-    print(f"   Perplexity (min) : {result['min_perplexity']}")
-    print(f"   Perplexity (max) : {result['max_perplexity']}")
-    print(f"   Perplexity (med) : {result['median_perplexity']}")
-    print(f"   Tokens evaluated : {result['total_tokens_evaluated']:,}")
-
-    # Quality assessment
-    if perplexity < 3.0:
-        print("   ✅ Excellent — very low perplexity")
-    elif perplexity < 5.0:
-        print("   ✅ Good — model is well fine-tuned")
-    elif perplexity < 10.0:
-        print("   ⚠️  Fair — consider more training or data")
-    else:
-        print("   ❌ High — model needs improvement")
-
-    return result
+    return float(perplexity)
 
 
-# ---------------------------------------------------------------------------
-# Metric 2: ROUGE Scores
-# ---------------------------------------------------------------------------
-def evaluate_rouge(
+# ──────────────────────────── ROUGE ───────────────────────────────
+
+
+def compute_rouge(
     model,
     tokenizer,
     eval_data_path: str,
     max_samples: int = 50,
-    max_new_tokens: int = 200,
+    max_new_tokens: int = 256,
 ) -> dict:
     """
-    Compute ROUGE scores by comparing generated outputs to reference outputs.
-
-    ROUGE-1, ROUGE-2, ROUGE-L measure n-gram overlap with reference responses.
-    Higher is better (0.0 to 1.0).
+    Compute ROUGE scores comparing model generations to reference outputs.
 
     Args:
-        model:          The loaded model.
-        tokenizer:      The corresponding tokenizer.
-        eval_data_path: Path to evaluation JSONL with reference outputs.
-        max_samples:    Maximum samples to evaluate (ROUGE is slower).
-        max_new_tokens: Max generation length per sample.
+        model: The loaded language model.
+        tokenizer: The loaded tokenizer.
+        eval_data_path: Path to JSONL evaluation data.
+        max_samples: Maximum number of samples.
+        max_new_tokens: Max tokens to generate per sample.
 
     Returns:
-        Dictionary with ROUGE-1, ROUGE-2, ROUGE-L F1 scores.
+        Dict with rouge1, rouge2, rougeL F1 scores.
     """
-    print("\n" + "=" * 60)
-    print("📊 Evaluating: ROUGE SCORES")
-    print("=" * 60)
+    console.print("[bold]📊 Computing ROUGE scores...[/]")
 
     try:
         from rouge_score import rouge_scorer
     except ImportError:
-        print("   ⚠️  rouge-score not installed. Run: pip install rouge-score")
-        return {"error": "rouge-score not installed"}
+        console.print("[yellow]⚠ rouge-score not installed. Run: pip install rouge-score[/]")
+        return {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
 
-    # Load evaluation data
+    if not os.path.exists(eval_data_path):
+        console.print(f"[bold red]❌ Eval data not found: {eval_data_path}[/]")
+        return {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
+
+    # Load eval samples
     samples = []
     with open(eval_data_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                record = json.loads(line)
-                samples.append(record)
-            if len(samples) >= max_samples:
-                break
+                try:
+                    samples.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
 
-    print(f"   Evaluating {len(samples)} samples...")
+    samples = samples[:max_samples]
+    console.print(f"   Evaluating on {len(samples)} samples...")
 
-    scorer = rouge_scorer.RougeScorer(
-        ["rouge1", "rouge2", "rougeL"],
-        use_stemmer=True,
-    )
-
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
     all_scores = {"rouge1": [], "rouge2": [], "rougeL": []}
 
     with torch.no_grad():
-        for i, sample in enumerate(samples):
-            instruction = sample.get("instruction", "You are a helpful AI assistant.")
-            user_input = sample.get("input", "")
+        for sample in tqdm(samples, desc="   ROUGE"):
+            prompt = f"<s>[INST] {sample.get('instruction', '')}\n\n{sample.get('input', '')} [/INST]"
             reference = sample.get("output", "")
 
-            # Build prompt (without reference)
-            if user_input.strip():
-                prompt = (
-                    f"### Instruction:\n{instruction}\n\n"
-                    f"### Input:\n{user_input}\n\n"
-                    f"### Response:\n"
-                )
-            else:
-                prompt = (
-                    f"### Instruction:\n{instruction}\n\n"
-                    f"### Response:\n"
-                )
+            if not reference:
+                continue
 
-            # Generate
-            inputs = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=1024,
-            ).to(model.device)
-
-            input_length = inputs["input_ids"].shape[1]
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
 
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                temperature=0.1,        # Low temp for consistent evaluation
-                do_sample=False,         # Greedy for reproducibility
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                temperature=0.1,
+                do_sample=False,
             )
 
             generated = tokenizer.decode(
-                outputs[0][input_length:],
+                outputs[0][inputs["input_ids"].shape[-1]:],
                 skip_special_tokens=True,
             ).strip()
 
-            # Score
             scores = scorer.score(reference, generated)
-            all_scores["rouge1"].append(scores["rouge1"].fmeasure)
-            all_scores["rouge2"].append(scores["rouge2"].fmeasure)
-            all_scores["rougeL"].append(scores["rougeL"].fmeasure)
+            for key in all_scores:
+                all_scores[key].append(scores[key].fmeasure)
 
-            if (i + 1) % 10 == 0:
-                avg_r1 = sum(all_scores["rouge1"]) / len(all_scores["rouge1"])
-                print(f"   [{i + 1}/{len(samples)}] Running ROUGE-1: {avg_r1:.4f}")
+    # Average scores
+    results = {}
+    for key in all_scores:
+        results[key] = float(np.mean(all_scores[key])) if all_scores[key] else 0.0
 
-    # Aggregate
-    result = {}
-    for metric_name, scores_list in all_scores.items():
-        if scores_list:
-            avg = sum(scores_list) / len(scores_list)
-            result[f"{metric_name}_f1"] = round(avg, 4)
-        else:
-            result[f"{metric_name}_f1"] = 0.0
+    table = Table(title="ROUGE Scores", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("F1 Score", style="bold")
+    for key, val in results.items():
+        color = "green" if val > 0.3 else "yellow" if val > 0.1 else "red"
+        table.add_row(key.upper(), f"[{color}]{val:.4f}[/]")
+    console.print(table)
 
-    result["samples_evaluated"] = len(samples)
-
-    print(f"\n   📈 Results:")
-    print(f"   ROUGE-1 (F1) : {result['rouge1_f1']:.4f}")
-    print(f"   ROUGE-2 (F1) : {result['rouge2_f1']:.4f}")
-    print(f"   ROUGE-L (F1) : {result['rougeL_f1']:.4f}")
-
-    return result
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Metric 3: Inference Speed
-# ---------------------------------------------------------------------------
-def evaluate_speed(
+# ──────────────────────────── Speed Benchmark ─────────────────────
+
+
+def speed_benchmark(
     model,
     tokenizer,
-    num_runs: int = 5,
     prompt: str = "Explain the concept of machine learning in detail.",
-    max_new_tokens: int = 200,
+    max_new_tokens: int = 256,
+    num_runs: int = 3,
 ) -> dict:
     """
-    Measure inference speed (tokens per second) over multiple runs.
-
-    Target for RTX 4060: ≥ 15 tokens/sec.
+    Benchmark inference speed (tokens/second) averaged over multiple runs.
+    Includes a GPU warmup pass.
 
     Args:
-        model:          The loaded model.
-        tokenizer:      The corresponding tokenizer.
-        num_runs:       Number of generation runs to average.
-        prompt:         Prompt to use for benchmarking.
+        model: The loaded language model.
+        tokenizer: The loaded tokenizer.
+        prompt: Prompt to use for benchmarking.
         max_new_tokens: Tokens to generate per run.
+        num_runs: Number of benchmark runs.
 
     Returns:
-        Dictionary with speed metrics.
+        Dict with avg_tokens_per_sec, total_tokens, avg_time_seconds.
     """
-    print("\n" + "=" * 60)
-    print("📊 Evaluating: INFERENCE SPEED")
-    print("=" * 60)
+    console.print("[bold]⚡ Running Speed Benchmark...[/]")
 
-    formatted = f"### Instruction:\n{prompt}\n\n### Response:\n"
+    formatted = f"<s>[INST] {prompt} [/INST]"
+    inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
 
-    inputs = tokenizer(
-        formatted,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-    ).to(model.device)
-
-    input_length = inputs["input_ids"].shape[1]
-
-    # Warmup run (first run is always slower due to CUDA kernel compilation)
-    print("   Warmup run...")
+    # Warmup pass (not counted)
+    console.print("   🔥 Warmup pass...")
     with torch.no_grad():
-        _ = model.generate(
-            **inputs,
-            max_new_tokens=50,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        model.generate(**inputs, max_new_tokens=20, do_sample=False)
 
-    # Timed runs
     times = []
-    tokens_list = []
+    token_counts = []
 
-    for run in range(num_runs):
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+    for i in range(num_runs):
+        torch.cuda.synchronize()
         start = time.time()
 
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                temperature=0.7,
+                do_sample=True,
             )
 
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        torch.cuda.synchronize()
         elapsed = time.time() - start
 
-        tokens_generated = outputs[0].shape[0] - input_length
-        tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
-
+        gen_tokens = outputs.shape[-1] - inputs["input_ids"].shape[-1]
         times.append(elapsed)
-        tokens_list.append(tokens_generated)
+        token_counts.append(gen_tokens)
 
-        print(f"   Run {run + 1}/{num_runs}: {tokens_generated} tokens, "
-              f"{elapsed:.2f}s, {tokens_per_sec:.1f} tok/s")
+        console.print(f"   Run {i + 1}/{num_runs}: {gen_tokens} tokens in {elapsed:.2f}s ({gen_tokens / elapsed:.1f} tok/s)")
 
-    # Aggregate
-    avg_time = sum(times) / len(times)
-    avg_tokens = sum(tokens_list) / len(tokens_list)
-    avg_tps = avg_tokens / avg_time if avg_time > 0 else 0
-    max_tps = max(t / e for t, e in zip(tokens_list, times) if e > 0)
-    min_tps = min(t / e for t, e in zip(tokens_list, times) if e > 0)
+    avg_time = np.mean(times)
+    avg_tokens = np.mean(token_counts)
+    avg_speed = avg_tokens / avg_time
 
     result = {
-        "avg_tokens_per_second": round(avg_tps, 1),
-        "max_tokens_per_second": round(max_tps, 1),
-        "min_tokens_per_second": round(min_tps, 1),
-        "avg_generation_time_seconds": round(avg_time, 3),
-        "avg_tokens_generated": round(avg_tokens, 0),
+        "avg_tokens_per_sec": float(avg_speed),
+        "total_tokens": int(sum(token_counts)),
+        "avg_time_seconds": float(avg_time),
         "num_runs": num_runs,
     }
 
-    print(f"\n   📈 Results:")
-    print(f"   Avg speed   : {result['avg_tokens_per_second']} tok/s")
-    print(f"   Max speed   : {result['max_tokens_per_second']} tok/s")
-    print(f"   Min speed   : {result['min_tokens_per_second']} tok/s")
-    print(f"   Avg time    : {result['avg_generation_time_seconds']}s")
-
-    if avg_tps >= 15:
-        print("   ✅ Target met (≥ 15 tok/s)")
-    else:
-        print("   ⚠️  Below target (< 15 tok/s)")
+    color = "green" if avg_speed >= 15 else "yellow" if avg_speed >= 10 else "red"
+    console.print(f"\n   Average speed: [{color}]{avg_speed:.1f} tok/s[/] (target: ≥ 15 tok/s)\n")
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Metric 4: Benchmark Prompts (Keyword Matching)
-# ---------------------------------------------------------------------------
-def evaluate_benchmark(
+# ──────────────────────────── Benchmark Prompts ───────────────────
+
+
+def run_benchmark_prompts(
     model,
     tokenizer,
-    benchmark_path: str = DEFAULT_BENCHMARK,
+    benchmark_path: str = BENCHMARK_PROMPTS_PATH,
+    max_new_tokens: int = 256,
 ) -> dict:
     """
-    Run benchmark prompts and score based on expected keyword presence.
-
-    Each prompt in ``benchmark_prompts.json`` has a list of expected keywords.
-    The score for each prompt is the fraction of expected keywords found
-    in the generated response.
+    Run qualitative evaluation using JSON-configured benchmark prompts.
+    Checks for expected keyword presence in generated outputs.
 
     Args:
-        model:          The loaded model.
-        tokenizer:      The corresponding tokenizer.
-        benchmark_path: Path to benchmark prompts JSON config.
+        model: The loaded language model.
+        tokenizer: The loaded tokenizer.
+        benchmark_path: Path to benchmark_prompts.json.
+        max_new_tokens: Tokens to generate per prompt.
 
     Returns:
-        Dictionary with per-prompt and aggregate scores.
+        Dict with per-prompt results and overall pass rate.
     """
-    print("\n" + "=" * 60)
-    print("📊 Evaluating: BENCHMARK PROMPTS")
-    print("=" * 60)
+    console.print("[bold]🎯 Running Benchmark Prompts...[/]")
 
     if not os.path.exists(benchmark_path):
-        print(f"   ⚠️  Benchmark file not found: {benchmark_path}")
-        return {"error": "File not found"}
+        console.print(f"[yellow]⚠ Benchmark file not found: {benchmark_path}[/]")
+        return {"pass_rate": 0.0, "results": []}
 
-    with open(benchmark_path, "r", encoding="utf-8") as f:
+    with open(benchmark_path, "r") as f:
         config = json.load(f)
 
     prompts = config.get("prompts", [])
-    eval_settings = config.get("evaluation_settings", {})
-    temperature = eval_settings.get("temperature", 0.1)
-    do_sample = eval_settings.get("do_sample", False)
+    defaults = config.get("model_defaults", {})
+    max_new_tokens = defaults.get("max_new_tokens", max_new_tokens)
 
-    print(f"   Running {len(prompts)} benchmark prompts...")
+    results = []
+    passed = 0
 
-    results_per_prompt = []
-    total_score = 0.0
+    table = Table(title="Benchmark Results", show_header=True)
+    table.add_column("ID", style="cyan", width=15)
+    table.add_column("Category", width=20)
+    table.add_column("Keywords Found", width=15)
+    table.add_column("Pass", width=6)
 
-    with torch.no_grad():
-        for i, prompt_config in enumerate(prompts):
-            prompt_id = prompt_config["id"]
-            category = prompt_config["category"]
-            prompt = prompt_config["prompt"]
-            expected_keywords = prompt_config.get("expected_keywords", [])
-            max_tokens = prompt_config.get("max_new_tokens", 256)
+    for prompt_config in tqdm(prompts, desc="   Benchmarks"):
+        prompt_text = prompt_config["prompt"]
+        expected_keywords = prompt_config.get("expected_keywords", [])
+        prompt_id = prompt_config.get("id", "unknown")
+        category = prompt_config.get("category", "unknown")
 
-            # Generate
-            formatted = f"### Instruction:\n{prompt}\n\n### Response:\n"
-            inputs = tokenizer(
-                formatted,
-                return_tensors="pt",
-                truncation=True,
-                max_length=1024,
-            ).to(model.device)
+        # Generate response
+        formatted = f"<s>[INST] {prompt_text} [/INST]"
+        inputs = tokenizer(formatted, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
 
-            input_length = inputs["input_ids"].shape[1]
-
+        with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature if do_sample else 1.0,
-                do_sample=do_sample,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                max_new_tokens=max_new_tokens,
+                temperature=defaults.get("temperature", 0.7),
+                top_p=defaults.get("top_p", 0.9),
+                do_sample=True,
             )
 
-            response = tokenizer.decode(
-                outputs[0][input_length:],
-                skip_special_tokens=True,
-            ).strip()
+        generated = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[-1]:],
+            skip_special_tokens=True,
+        ).strip()
 
-            # Score by keyword presence
-            response_lower = response.lower()
-            found_keywords = [
-                kw for kw in expected_keywords
-                if kw.lower() in response_lower
-            ]
-            keyword_score = (
-                len(found_keywords) / len(expected_keywords)
-                if expected_keywords
-                else 1.0
-            )
+        # Check keyword matches
+        found_keywords = [kw for kw in expected_keywords if kw.lower() in generated.lower()]
+        match_ratio = len(found_keywords) / len(expected_keywords) if expected_keywords else 1.0
+        is_pass = match_ratio >= 0.5  # Pass if ≥50% keywords found
 
-            total_score += keyword_score
+        if is_pass:
+            passed += 1
 
-            prompt_result = {
-                "id": prompt_id,
-                "category": category,
-                "prompt": prompt,
-                "response_preview": response[:200] + "..." if len(response) > 200 else response,
-                "expected_keywords": expected_keywords,
-                "found_keywords": found_keywords,
-                "missing_keywords": [kw for kw in expected_keywords if kw not in found_keywords],
-                "keyword_score": round(keyword_score, 3),
-            }
-            results_per_prompt.append(prompt_result)
+        result = {
+            "id": prompt_id,
+            "category": category,
+            "prompt": prompt_text,
+            "generated": generated[:200] + "..." if len(generated) > 200 else generated,
+            "expected_keywords": expected_keywords,
+            "found_keywords": found_keywords,
+            "match_ratio": match_ratio,
+            "passed": is_pass,
+        }
+        results.append(result)
 
-            status = "✅" if keyword_score >= 0.6 else "⚠️" if keyword_score >= 0.3 else "❌"
-            print(f"   {status} [{prompt_id}] Score: {keyword_score:.0%} "
-                  f"({len(found_keywords)}/{len(expected_keywords)} keywords)")
+        color = "green" if is_pass else "red"
+        table.add_row(
+            prompt_id,
+            category,
+            f"{len(found_keywords)}/{len(expected_keywords)}",
+            f"[{color}]{'✅' if is_pass else '❌'}[/]",
+        )
 
-    # Aggregate
-    avg_score = total_score / len(prompts) if prompts else 0
-    pass_count = sum(1 for r in results_per_prompt if r["keyword_score"] >= 0.6)
+    console.print(table)
 
-    result = {
-        "avg_keyword_score": round(avg_score, 4),
-        "pass_rate": round(pass_count / len(prompts), 4) if prompts else 0,
-        "passed": pass_count,
-        "total": len(prompts),
-        "per_prompt": results_per_prompt,
-    }
+    pass_rate = passed / len(prompts) if prompts else 0.0
+    color = "green" if pass_rate >= 0.7 else "yellow" if pass_rate >= 0.5 else "red"
+    console.print(f"\n   Overall pass rate: [{color}]{pass_rate:.0%}[/] ({passed}/{len(prompts)})\n")
 
-    # Per-category summary
-    categories = set(r["category"] for r in results_per_prompt)
-    category_scores = {}
-    for cat in categories:
-        cat_results = [r for r in results_per_prompt if r["category"] == cat]
-        cat_avg = sum(r["keyword_score"] for r in cat_results) / len(cat_results)
-        category_scores[cat] = round(cat_avg, 4)
-
-    result["category_scores"] = category_scores
-
-    print(f"\n   📈 Aggregate Results:")
-    print(f"   Avg keyword score : {result['avg_keyword_score']:.1%}")
-    print(f"   Pass rate (≥60%)  : {result['pass_rate']:.1%} ({pass_count}/{len(prompts)})")
-    for cat, score in category_scores.items():
-        print(f"   [{cat}] : {score:.1%}")
-
-    return result
+    return {"pass_rate": pass_rate, "passed": passed, "total": len(prompts), "results": results}
 
 
-# ---------------------------------------------------------------------------
-# Full Evaluation Pipeline
-# ---------------------------------------------------------------------------
-def run_full_evaluation(
-    base_model: str,
-    adapter_path: str = None,
-    eval_data_path: str = DEFAULT_EVAL_DATA,
-    benchmark_path: str = DEFAULT_BENCHMARK,
-    max_perplexity_samples: int = DEFAULT_MAX_SAMPLES,
-    max_rouge_samples: int = 50,
-    speed_runs: int = 5,
-    output_path: str = None,
-) -> dict:
-    """
-    Run the complete evaluation suite: perplexity, ROUGE, speed, benchmarks.
+# ──────────────────────────── VRAM Report ─────────────────────────
 
-    Args:
-        base_model:              HuggingFace model ID.
-        adapter_path:            Path to LoRA adapter (or None for base model).
-        eval_data_path:          Path to evaluation JSONL.
-        benchmark_path:          Path to benchmark prompts JSON.
-        max_perplexity_samples:  Max samples for perplexity.
-        max_rouge_samples:       Max samples for ROUGE.
-        speed_runs:              Number of speed benchmark runs.
-        output_path:             Where to save the evaluation report JSON.
 
-    Returns:
-        Complete evaluation report dictionary.
-    """
-    print("\n" + "=" * 60)
-    print("🎯 QLoRA Model Evaluation Suite")
-    print("=" * 60)
+def vram_report() -> dict:
+    """Report current GPU VRAM usage."""
+    if not torch.cuda.is_available():
+        return {"available": False}
 
-    # Load model
-    model, tokenizer = load_model(base_model, adapter_path)
+    allocated = torch.cuda.memory_allocated(0) / 1e9
+    reserved = torch.cuda.memory_reserved(0) / 1e9
+    total = torch.cuda.get_device_properties(0).total_mem / 1e9
+    free = total - allocated
 
     report = {
-        "model": base_model,
-        "adapter": adapter_path,
-        "eval_data": eval_data_path,
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+        "gpu": torch.cuda.get_device_name(0),
+        "allocated_gb": round(allocated, 2),
+        "reserved_gb": round(reserved, 2),
+        "total_gb": round(total, 2),
+        "free_gb": round(free, 2),
+        "utilization_pct": round(allocated / total * 100, 1),
     }
 
-    # 1. Perplexity
-    if eval_data_path and os.path.exists(eval_data_path):
-        report["perplexity"] = evaluate_perplexity(
-            model, tokenizer, eval_data_path,
-            max_samples=max_perplexity_samples,
-        )
-    else:
-        print(f"\n⚠️  Eval data not found: {eval_data_path}")
-        print("   Skipping perplexity & ROUGE evaluation.")
-        report["perplexity"] = {"skipped": True}
-
-    # 2. ROUGE
-    if eval_data_path and os.path.exists(eval_data_path):
-        report["rouge"] = evaluate_rouge(
-            model, tokenizer, eval_data_path,
-            max_samples=max_rouge_samples,
-        )
-    else:
-        report["rouge"] = {"skipped": True}
-
-    # 3. Speed
-    report["speed"] = evaluate_speed(
-        model, tokenizer,
-        num_runs=speed_runs,
-    )
-
-    # 4. Benchmark prompts
-    report["benchmark"] = evaluate_benchmark(
-        model, tokenizer,
-        benchmark_path=benchmark_path,
-    )
-
-    # --- Save report ---
-    if output_path is None:
-        output_path = str(PROJECT_ROOT / "models" / "evaluation_report.json")
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        # Remove per-prompt details for cleaner top-level report
-        clean_report = {k: v for k, v in report.items()}
-        json.dump(clean_report, f, indent=2, default=str)
-    print(f"\n💾 Evaluation report saved → {output_path}")
-
-    # --- Summary ---
-    print("\n" + "=" * 60)
-    print("📋 EVALUATION SUMMARY")
-    print("=" * 60)
-    print(f"   Model     : {base_model}")
-    print(f"   Adapter   : {adapter_path or 'None'}")
-    print(f"   GPU       : {report['gpu']}")
-    print()
-
-    if "perplexity" in report and not report["perplexity"].get("skipped"):
-        ppl = report["perplexity"].get("perplexity", "N/A")
-        print(f"   Perplexity      : {ppl}")
-
-    if "rouge" in report and not report["rouge"].get("skipped"):
-        r1 = report["rouge"].get("rouge1_f1", "N/A")
-        rL = report["rouge"].get("rougeL_f1", "N/A")
-        print(f"   ROUGE-1 (F1)    : {r1}")
-        print(f"   ROUGE-L (F1)    : {rL}")
-
-    if "speed" in report:
-        tps = report["speed"].get("avg_tokens_per_second", "N/A")
-        print(f"   Speed           : {tps} tok/s")
-
-    if "benchmark" in report and not report["benchmark"].get("error"):
-        score = report["benchmark"].get("avg_keyword_score", "N/A")
-        rate = report["benchmark"].get("pass_rate", "N/A")
-        print(f"   Benchmark score : {score}")
-        print(f"   Benchmark pass  : {rate}")
-
-    print("=" * 60)
-    print("✅ Evaluation complete!")
+    table = Table(title="📊 VRAM Report", show_header=False)
+    table.add_column("", style="cyan")
+    table.add_column("", style="bold")
+    table.add_row("GPU", report["gpu"])
+    table.add_row("Allocated", f"{report['allocated_gb']:.2f} GB")
+    table.add_row("Reserved", f"{report['reserved_gb']:.2f} GB")
+    table.add_row("Total", f"{report['total_gb']:.2f} GB")
+    table.add_row("Free", f"{report['free_gb']:.2f} GB")
+    table.add_row("Utilization", f"{report['utilization_pct']:.1f}%")
+    console.print(table)
 
     return report
 
 
-# ---------------------------------------------------------------------------
-# CLI Entry Point
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="QLoRA Model Evaluation Suite — Perplexity, ROUGE, Speed, Benchmarks",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Full evaluation
-  python scripts/evaluate.py \\
-      --base_model mistralai/Mistral-7B-Instruct-v0.2 \\
-      --adapter_path models/my-model/final_adapter \\
-      --eval_data data/train.jsonl
+# ──────────────────────────── Full Evaluation ─────────────────────
 
-  # Benchmark prompts only
-  python scripts/evaluate.py \\
-      --adapter_path models/my-model/final_adapter \\
-      --benchmark_only
 
-  # Custom output
-  python scripts/evaluate.py \\
-      --output_path results/eval_report.json
-        """,
+def run_full_evaluation(model, tokenizer, args):
+    """Run the complete evaluation suite and save results."""
+    console.print(Panel(
+        "[bold cyan]📊 Full Evaluation Suite[/]\n"
+        f"Model: [white]{args.base_model}[/]\n"
+        f"Adapter: [white]{args.adapter_path}[/]\n"
+        f"Eval Data: [white]{args.eval_data}[/]",
+        title="Evaluation Configuration",
+        border_style="cyan",
+    ))
+
+    all_results = {}
+
+    # 1. VRAM Report
+    console.print("\n" + "=" * 50)
+    all_results["vram"] = vram_report()
+
+    # 2. Perplexity
+    console.print("=" * 50)
+    all_results["perplexity"] = compute_perplexity(
+        model, tokenizer, args.eval_data,
+        max_samples=args.max_samples,
     )
 
-    parser.add_argument("--base_model", type=str, default=DEFAULT_MODEL,
-                        help=f"HuggingFace model ID (default: {DEFAULT_MODEL})")
-    parser.add_argument("--adapter_path", type=str, default=None,
-                        help="Path to LoRA adapter directory")
-    parser.add_argument("--eval_data", type=str, default=DEFAULT_EVAL_DATA,
-                        help=f"Evaluation JSONL path (default: {DEFAULT_EVAL_DATA})")
-    parser.add_argument("--benchmark_path", type=str, default=DEFAULT_BENCHMARK,
-                        help="Path to benchmark prompts JSON")
-    parser.add_argument("--max_perplexity_samples", type=int, default=DEFAULT_MAX_SAMPLES,
-                        help=f"Max samples for perplexity (default: {DEFAULT_MAX_SAMPLES})")
-    parser.add_argument("--max_rouge_samples", type=int, default=50,
-                        help="Max samples for ROUGE (default: 50)")
-    parser.add_argument("--speed_runs", type=int, default=5,
-                        help="Number of speed benchmark runs (default: 5)")
-    parser.add_argument("--output_path", type=str, default=None,
-                        help="Where to save evaluation report JSON")
+    # 3. Speed Benchmark
+    console.print("=" * 50)
+    all_results["speed"] = speed_benchmark(
+        model, tokenizer,
+        num_runs=args.speed_runs,
+    )
+
+    # 4. ROUGE (optional — can be slow)
+    if args.compute_rouge:
+        console.print("=" * 50)
+        all_results["rouge"] = compute_rouge(
+            model, tokenizer, args.eval_data,
+            max_samples=min(args.max_samples, 50),
+        )
+
+    # 5. Benchmark Prompts (if file exists)
+    if os.path.exists(args.benchmark_path):
+        console.print("=" * 50)
+        all_results["benchmark_prompts"] = run_benchmark_prompts(
+            model, tokenizer,
+            benchmark_path=args.benchmark_path,
+        )
+
+    # ── Summary ──
+    console.print("\n" + "=" * 50)
+    summary = Table(title="📋 Evaluation Summary", show_header=True)
+    summary.add_column("Metric", style="cyan", width=25)
+    summary.add_column("Value", style="bold", width=20)
+    summary.add_column("Target", width=15)
+    summary.add_column("Status", width=6)
+
+    # Perplexity
+    ppl = all_results.get("perplexity", float("inf"))
+    ppl_pass = "✅" if ppl < 5.0 else "❌"
+    summary.add_row("Perplexity", f"{ppl:.4f}", "< 5.0", ppl_pass)
+
+    # Speed
+    speed = all_results.get("speed", {}).get("avg_tokens_per_sec", 0)
+    speed_pass = "✅" if speed >= 15 else "❌"
+    summary.add_row("Tokens/sec", f"{speed:.1f}", "≥ 15", speed_pass)
+
+    # ROUGE
+    if "rouge" in all_results:
+        r1 = all_results["rouge"].get("rouge1", 0)
+        summary.add_row("ROUGE-1 F1", f"{r1:.4f}", "> 0.3", "✅" if r1 > 0.3 else "❌")
+
+    # Benchmark pass rate
+    if "benchmark_prompts" in all_results:
+        pr = all_results["benchmark_prompts"].get("pass_rate", 0)
+        summary.add_row("Benchmark Pass", f"{pr:.0%}", "≥ 70%", "✅" if pr >= 0.7 else "❌")
+
+    # VRAM
+    vram_used = all_results.get("vram", {}).get("allocated_gb", 0)
+    summary.add_row("VRAM Usage", f"{vram_used:.2f} GB", "≤ 7.5 GB", "✅" if vram_used <= 7.5 else "❌")
+
+    console.print(summary)
+
+    # Save results to JSON
+    output_file = os.path.join(os.path.dirname(args.eval_data) or ".", "eval_results.json")
+    with open(output_file, "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+    console.print(f"\n💾 Results saved → [cyan]{output_file}[/]\n")
+
+    return all_results
+
+
+# ──────────────────────────── CLI ─────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="QLoRA Evaluation Suite — Perplexity, ROUGE, Speed, Benchmarks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("--base_model", default=DEFAULT_BASE_MODEL,
+                        help=f"Base model (default: {DEFAULT_BASE_MODEL})")
+    parser.add_argument("--adapter_path", default=DEFAULT_ADAPTER,
+                        help=f"LoRA adapter (default: {DEFAULT_ADAPTER})")
+    parser.add_argument("--eval_data", default=DEFAULT_EVAL_DATA,
+                        help=f"Eval JSONL (default: {DEFAULT_EVAL_DATA})")
+    parser.add_argument("--benchmark_path", default=BENCHMARK_PROMPTS_PATH,
+                        help=f"Benchmark prompts JSON (default: {BENCHMARK_PROMPTS_PATH})")
+
+    # Evaluation options
+    parser.add_argument("--max_samples", type=int, default=100,
+                        help="Max samples for perplexity/ROUGE (default: 100)")
+    parser.add_argument("--speed_runs", type=int, default=3,
+                        help="Number of speed benchmark runs (default: 3)")
+    parser.add_argument("--compute_rouge", action="store_true",
+                        help="Include ROUGE evaluation (slower)")
+
+    # Quick mode options
+    parser.add_argument("--perplexity_only", action="store_true",
+                        help="Only compute perplexity")
+    parser.add_argument("--speed_only", action="store_true",
+                        help="Only run speed benchmark")
     parser.add_argument("--benchmark_only", action="store_true",
-                        help="Run only benchmark prompts (skip perplexity/ROUGE/speed)")
+                        help="Only run benchmark prompts")
 
     args = parser.parse_args()
 
-    if args.benchmark_only:
-        # Quick benchmark-only mode
-        model, tokenizer = load_model(args.base_model, args.adapter_path)
-        result = evaluate_benchmark(model, tokenizer, args.benchmark_path)
-        print(json.dumps(result, indent=2, default=str))
+    # Load model
+    model, tokenizer = load_model_for_eval(args.base_model, args.adapter_path)
+
+    # Quick mode or full evaluation
+    if args.perplexity_only:
+        compute_perplexity(model, tokenizer, args.eval_data, max_samples=args.max_samples)
+    elif args.speed_only:
+        speed_benchmark(model, tokenizer, num_runs=args.speed_runs)
+    elif args.benchmark_only:
+        run_benchmark_prompts(model, tokenizer, benchmark_path=args.benchmark_path)
     else:
-        run_full_evaluation(
-            base_model=args.base_model,
-            adapter_path=args.adapter_path,
-            eval_data_path=args.eval_data,
-            benchmark_path=args.benchmark_path,
-            max_perplexity_samples=args.max_perplexity_samples,
-            max_rouge_samples=args.max_rouge_samples,
-            speed_runs=args.speed_runs,
-            output_path=args.output_path,
-        )
+        run_full_evaluation(model, tokenizer, args)
 
 
 if __name__ == "__main__":

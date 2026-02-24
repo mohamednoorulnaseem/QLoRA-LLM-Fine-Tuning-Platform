@@ -1,7 +1,7 @@
-# 🚀 QLoRA Fine-tuning: 7B LLM on Consumer GPU
+# 🚀 QLoRA Fine-tuning: 7B LLM on RTX 4060
 
 > Fine-tune Mistral-7B or LLaMA-3-8B on your own data using 4-bit quantization.
-> Optimized for **8GB VRAM** — runs fully on any CUDA-capable GPU.
+> Optimized for **8GB VRAM** — runs fully on your Lenovo LOQ RTX 4060.
 
 ---
 
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 # 5. Verify GPU is detected
 python -c "import torch; print(torch.cuda.get_device_name(0))"
-# Expected: Your GPU name (e.g. NVIDIA GeForce RTX xxxx)
+# Expected: NVIDIA GeForce RTX 4060 Laptop GPU
 ```
 
 ---
@@ -128,7 +128,7 @@ python scripts/train.py \
 --model_name microsoft/Phi-3-mini-4k-instruct
 ```
 
-### Expected Training Time (8GB VRAM GPU):
+### Expected Training Time (RTX 4060):
 
 | Dataset Size   | Epochs | Time      |
 | -------------- | ------ | --------- |
@@ -185,7 +185,7 @@ python scripts/evaluate.py \
 
 ---
 
-## 🎯 VRAM Optimization Tips (8GB VRAM GPU)
+## 🎯 VRAM Optimization Tips (for your RTX 4060 8GB)
 
 | Technique                       | VRAM Saving | Applied? |
 | ------------------------------- | ----------- | -------- |
