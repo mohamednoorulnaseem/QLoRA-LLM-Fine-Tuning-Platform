@@ -1,7 +1,7 @@
-# 🚀 QLoRA Fine-tuning: 7B LLM on RTX 4060
+# 🚀 QLoRA Fine-tuning: 7B LLM on Consumer GPU
 
 > Fine-tune Mistral-7B or LLaMA-3-8B on your own data using 4-bit quantization.
-> Optimized for **8GB VRAM** — runs fully on your Lenovo LOQ RTX 4060.
+> Optimized for **8GB VRAM** — runs fully on any CUDA-capable GPU.
 
 ---
 
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 # 5. Verify GPU is detected
 python -c "import torch; print(torch.cuda.get_device_name(0))"
-# Expected: NVIDIA GeForce RTX 4060 Laptop GPU
+# Expected: Your GPU name (e.g. NVIDIA GeForce RTX xxxx)
 ```
 
 ---
@@ -58,13 +58,16 @@ Your data must be in **JSONL format** (one JSON object per line):
 ```
 
 ### Option A: Use sample data to test
+
 ```bash
 python scripts/prepare_data.py
 # Creates data/train.jsonl with example samples
 ```
 
 ### Option B: Convert your CSV
+
 Edit `prepare_data.py` and call:
+
 ```python
 csv_to_jsonl(
     csv_path="your_data.csv",
@@ -76,6 +79,7 @@ csv_to_jsonl(
 ```
 
 ### Option C: Use a HuggingFace dataset
+
 ```python
 hf_dataset_to_jsonl(
     dataset_name="tatsu-lab/alpaca",   # Or your preferred dataset
@@ -89,6 +93,7 @@ hf_dataset_to_jsonl(
 ## 🏋️ Step 3: Train
 
 ### Basic training (Mistral-7B)
+
 ```bash
 python scripts/train.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.2 \
@@ -100,6 +105,7 @@ python scripts/train.py \
 ```
 
 ### With Weights & Biases logging
+
 ```bash
 wandb login   # First time only
 python scripts/train.py \
@@ -110,6 +116,7 @@ python scripts/train.py \
 ```
 
 ### Alternative models (all fit in 8GB VRAM with QLoRA)
+
 ```bash
 # LLaMA 3 8B
 --model_name meta-llama/Meta-Llama-3-8B-Instruct
@@ -121,18 +128,20 @@ python scripts/train.py \
 --model_name microsoft/Phi-3-mini-4k-instruct
 ```
 
-### Expected Training Time (RTX 4060):
-| Dataset Size | Epochs | Time |
-|---|---|---|
-| 1,000 samples | 3 | ~30 min |
-| 10,000 samples | 3 | ~4 hours |
-| 50,000 samples | 3 | ~18 hours |
+### Expected Training Time (8GB VRAM GPU):
+
+| Dataset Size   | Epochs | Time      |
+| -------------- | ------ | --------- |
+| 1,000 samples  | 3      | ~30 min   |
+| 10,000 samples | 3      | ~4 hours  |
+| 50,000 samples | 3      | ~18 hours |
 
 ---
 
 ## 💬 Step 4: Run Inference
 
 ### Interactive Chat
+
 ```bash
 python scripts/inference.py \
   --base_model mistralai/Mistral-7B-Instruct-v0.2 \
@@ -141,6 +150,7 @@ python scripts/inference.py \
 ```
 
 ### Single prompt
+
 ```bash
 python scripts/inference.py \
   --adapter_path models/my-finetuned-model/final_adapter \
@@ -149,6 +159,7 @@ python scripts/inference.py \
 ```
 
 ### Deploy as REST API
+
 ```bash
 python scripts/inference.py \
   --adapter_path models/my-finetuned-model/final_adapter \
@@ -174,16 +185,16 @@ python scripts/evaluate.py \
 
 ---
 
-## 🎯 VRAM Optimization Tips (for your RTX 4060 8GB)
+## 🎯 VRAM Optimization Tips (8GB VRAM GPU)
 
-| Technique | VRAM Saving | Applied? |
-|---|---|---|
-| 4-bit quantization (NF4) | ~50% | ✅ |
-| Double quantization | ~0.4GB | ✅ |
-| Gradient checkpointing | ~30% | ✅ |
-| Paged AdamW optimizer | ~2GB | ✅ |
-| Batch size = 2 + grad accum = 4 | Controlled | ✅ |
-| fp16 mixed precision | ~50% | ✅ |
+| Technique                       | VRAM Saving | Applied? |
+| ------------------------------- | ----------- | -------- |
+| 4-bit quantization (NF4)        | ~50%        | ✅       |
+| Double quantization             | ~0.4GB      | ✅       |
+| Gradient checkpointing          | ~30%        | ✅       |
+| Paged AdamW optimizer           | ~2GB        | ✅       |
+| Batch size = 2 + grad accum = 4 | Controlled  | ✅       |
+| fp16 mixed precision            | ~50%        | ✅       |
 
 **Expected peak VRAM usage: 6.5–7.5GB out of 8GB ✅**
 
@@ -192,6 +203,7 @@ python scripts/evaluate.py \
 ## 🔧 Troubleshooting
 
 **CUDA OOM Error:**
+
 ```bash
 # Reduce max_seq_len
 --max_seq_len 1024  # Instead of 2048
@@ -201,12 +213,14 @@ python scripts/evaluate.py \
 ```
 
 **Model download slow / fails:**
+
 ```bash
 # Set HuggingFace mirror
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
 **bitsandbytes error on Windows:**
+
 ```bash
 pip install bitsandbytes-windows
 ```
