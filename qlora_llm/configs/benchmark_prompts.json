@@ -1,0 +1,121 @@
+{
+  "version": "1.0",
+  "description": "Benchmark prompts for QLoRA fine-tuned model evaluation",
+  "author": "Mohamed Noorul Naseem M",
+  "prompts": [
+    {
+      "id": "general_01",
+      "category": "general",
+      "prompt": "Explain the transformer architecture in simple terms.",
+      "expected_keywords": [
+        "attention",
+        "encoder",
+        "decoder",
+        "self-attention",
+        "tokens"
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "general_02",
+      "category": "general",
+      "prompt": "What are the key differences between supervised and unsupervised learning?",
+      "expected_keywords": [
+        "labeled",
+        "unlabeled",
+        "classification",
+        "clustering",
+        "regression"
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "general_03",
+      "category": "general",
+      "prompt": "Describe the concept of transfer learning and why it is useful.",
+      "expected_keywords": [
+        "pretrained",
+        "fine-tune",
+        "domain",
+        "features",
+        "generalization"
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "qlora_01",
+      "category": "qlora",
+      "prompt": "What is QLoRA and how does it enable fine-tuning large models on consumer GPUs?",
+      "expected_keywords": [
+        "quantization",
+        "4-bit",
+        "LoRA",
+        "adapter",
+        "VRAM",
+        "memory"
+      ],
+      "max_new_tokens": 300
+    },
+    {
+      "id": "qlora_02",
+      "category": "qlora",
+      "prompt": "Explain the difference between full fine-tuning, LoRA, and QLoRA.",
+      "expected_keywords": [
+        "parameters",
+        "rank",
+        "quantized",
+        "adapter",
+        "efficient"
+      ],
+      "max_new_tokens": 300
+    },
+    {
+      "id": "code_01",
+      "category": "code",
+      "prompt": "Write a Python function that calculates the Fibonacci sequence using dynamic programming.",
+      "expected_keywords": ["def", "fibonacci", "return", "for", "range"],
+      "max_new_tokens": 300
+    },
+    {
+      "id": "code_02",
+      "category": "code",
+      "prompt": "Explain how a hash map works internally and its average time complexity.",
+      "expected_keywords": ["hash", "bucket", "collision", "O(1)", "key"],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "medical_01",
+      "category": "medical",
+      "prompt": "What are the common symptoms and treatment options for Type 2 diabetes?",
+      "expected_keywords": [
+        "insulin",
+        "blood sugar",
+        "glucose",
+        "diet",
+        "medication"
+      ],
+      "max_new_tokens": 300
+    },
+    {
+      "id": "reasoning_01",
+      "category": "reasoning",
+      "prompt": "A farmer has 3 fields. Field A produces 200 kg of wheat, Field B produces 150 kg, and Field C produces 250 kg. If he sells wheat at $2 per kg, what is his total revenue?",
+      "expected_keywords": ["600", "1200", "total", "revenue"],
+      "max_new_tokens": 200
+    },
+    {
+      "id": "creative_01",
+      "category": "creative",
+      "prompt": "Write a short poem about artificial intelligence and the future of humanity.",
+      "expected_keywords": ["AI", "future", "machine", "human"],
+      "max_new_tokens": 200
+    }
+  ],
+  "evaluation_settings": {
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "repetition_penalty": 1.15,
+    "do_sample": false,
+    "num_return_sequences": 1
+  }
+}

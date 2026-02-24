@@ -1,0 +1,46 @@
+# ============================================================
+# QLoRA LLM Fine-Tuning Platform — Requirements
+# Optimized for: RTX 4060 8GB | CUDA 12.1+ | Python 3.10/3.11
+# ============================================================
+
+# --- Core ML Framework ---
+# PyTorch installed separately:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+transformers==4.44.2
+accelerate==0.33.0
+datasets==2.20.0
+
+# --- QLoRA / LoRA ---
+peft==0.12.0
+bitsandbytes==0.43.3
+trl==0.9.6
+
+# --- Inference / API ---
+fastapi==0.112.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+
+# --- Evaluation ---
+rouge-score==0.1.2
+nltk==3.9.1
+scikit-learn==1.5.1
+
+# --- Data Preparation ---
+pandas==2.2.2
+
+# --- Experiment Tracking ---
+wandb==0.17.7
+tensorboard==2.17.1
+
+# --- Utilities ---
+sentencepiece==0.2.0
+protobuf==5.27.3
+safetensors==0.4.4
+huggingface-hub==0.24.5
+einops==0.8.0
+scipy==1.14.0
+tqdm==4.66.5
+
+# --- Code Quality (dev) ---
+black==24.8.0
+flake8==7.1.1
