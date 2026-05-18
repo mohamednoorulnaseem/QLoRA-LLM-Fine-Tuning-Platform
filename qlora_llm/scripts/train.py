@@ -33,6 +33,12 @@ import sys
 import time
 from pathlib import Path
 
+# Fix Windows charmap issue with emoji in Rich output
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -46,7 +52,7 @@ from transformers import (
     EarlyStoppingCallback,
     TrainingArguments,
 )
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 
 console = Console()
 
@@ -74,7 +80,7 @@ def print_gpu_info():
         sys.exit(1)
 
     gpu_name = torch.cuda.get_device_name(0)
-    total_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+    total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     current_mem = torch.cuda.memory_allocated(0) / 1e9
     reserved_mem = torch.cuda.memory_reserved(0) / 1e9
 
@@ -161,7 +167,7 @@ def train(args):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,  # Saves ~0.4GB extra VRAM
     )
 
@@ -186,7 +192,7 @@ def train(args):
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     )
 
     # Enable gradient checkpointing (saves ~30% VRAM)
@@ -227,10 +233,10 @@ def train(args):
     table.add_row("Trainable %", f"{trainable_pct:.4f}%")
     console.print(table)
 
-    # ── 6. Training arguments ──
-    console.print("\n[bold]🏋️ Step 6: Configuring training arguments...[/]")
+    # ── 6. SFT configuration ──
+    console.print("\n[bold]🏋️ Step 6: Configuring SFTConfig...[/]")
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -240,9 +246,9 @@ def train(args):
         weight_decay=0.01,
         optim="paged_adamw_32bit",
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        fp16=True,
-        bf16=False,
+        warmup_steps=100,
+        fp16=False,
+        bf16=True,
         max_grad_norm=0.3,
         logging_steps=10,
         save_strategy="steps",
@@ -255,11 +261,11 @@ def train(args):
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_steps=-1,
-        group_by_length=True,
         report_to="wandb" if args.use_wandb else "tensorboard",
         seed=args.seed,
         dataloader_pin_memory=True,
         remove_unused_columns=False,
+        max_length=args.max_seq_len,
     )
 
     # ── 7. Initialize trainer ──
@@ -278,9 +284,8 @@ def train(args):
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["test"],
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         formatting_func=format_prompt,
-        max_seq_length=args.max_seq_len,
         callbacks=callbacks,
     )
 
@@ -290,7 +295,9 @@ def train(args):
     console.print("=" * 60 + "\n")
 
     mem_before = torch.cuda.memory_allocated(0) / 1e9
-    trainer.train()
+    if args.resume_from_checkpoint:
+        console.print(f"   ♻️  Resuming from checkpoint: [cyan]{args.resume_from_checkpoint}[/]")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     mem_after = torch.cuda.max_memory_allocated(0) / 1e9
 
     # ── 9. Save the final adapter ──
@@ -389,6 +396,8 @@ def main():
                         help="Use Weights & Biases for logging (default: TensorBoard)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint dir to resume training from (e.g. models/mistral-mixed-v1/checkpoint-100)")
 
     args = parser.parse_args()
     train(args)

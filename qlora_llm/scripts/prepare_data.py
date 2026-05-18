@@ -299,10 +299,20 @@ def hf_dataset_to_jsonl(
     count = 0
     with open(output_path, "w", encoding="utf-8") as f:
         for sample in tqdm(dataset, desc="Converting HF → JSONL"):
+            # Handle list-type fields (e.g., UltraChat 'messages')
+            def extract_field(field_name, default=""):
+                val = sample.get(field_name, default)
+                if isinstance(val, list):
+                    # If it's a list of dicts with 'content' (standard ChatML)
+                    if val and isinstance(val[0], dict) and "content" in val[0]:
+                        return "\n\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in val])
+                    return "\n\n".join([str(v) for v in val])
+                return str(val or default).strip()
+
             entry = {
-                "instruction": str(sample.get(instruction_field, "You are a helpful assistant.")).strip(),
-                "input": str(sample.get(input_field, "")).strip(),
-                "output": str(sample.get(output_field, "")).strip(),
+                "instruction": extract_field(instruction_field, "You are a helpful assistant."),
+                "input": extract_field(input_field, ""),
+                "output": extract_field(output_field, ""),
             }
             if entry["output"]:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -446,6 +456,9 @@ Examples:
     # HuggingFace options
     parser.add_argument("--hf_name", help="HuggingFace dataset name (e.g., tatsu-lab/alpaca)")
     parser.add_argument("--hf_split", default="train", help="Dataset split (default: train)")
+    parser.add_argument("--hf_instruction", default="instruction", help="Field for instruction")
+    parser.add_argument("--hf_input", default="input", help="Field for input")
+    parser.add_argument("--hf_output", default="output", help="Field for output")
     parser.add_argument("--max_samples", type=int, help="Maximum samples to include")
 
     # General
@@ -487,6 +500,9 @@ Examples:
             output_path=args.output,
             split=args.hf_split,
             max_samples=args.max_samples,
+            instruction_field=args.hf_instruction,
+            input_field=args.hf_input,
+            output_field=args.hf_output,
         )
 
     # Validate generated file

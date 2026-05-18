@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  qlora-inference-api:
+    build: .
+    container_name: qlora-inference-api
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
+      # Uncomment and configure if using a saved adapter path
+      # - ADAPTER_PATH=/app/models/my-finetuned-model/final_adapter
+    volumes:
+      - ./models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

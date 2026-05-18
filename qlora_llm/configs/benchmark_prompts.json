@@ -1,117 +1,22 @@
-{
-  "description": "Benchmark prompts for qualitative evaluation of fine-tuned QLoRA models",
-  "version": "1.0",
-  "model_defaults": {
-    "max_new_tokens": 256,
-    "temperature": 0.7,
-    "top_p": 0.9
+[
+  {
+    "category": "Coding",
+    "prompt": "Write a Python function to compute the Fibonacci sequence using memoization.",
+    "expected_keywords": ["def", "fibonacci", "memo", "return"]
   },
-  "prompts": [
-    {
-      "id": "general_01",
-      "category": "general_knowledge",
-      "prompt": "Explain the concept of machine learning in simple terms that a high school student would understand.",
-      "expected_keywords": [
-        "data",
-        "patterns",
-        "learn",
-        "predict",
-        "algorithm"
-      ],
-      "min_output_tokens": 50
-    },
-    {
-      "id": "general_02",
-      "category": "general_knowledge",
-      "prompt": "What is the difference between supervised and unsupervised learning?",
-      "expected_keywords": [
-        "labeled",
-        "unlabeled",
-        "classification",
-        "clustering",
-        "training"
-      ],
-      "min_output_tokens": 50
-    },
-    {
-      "id": "technical_01",
-      "category": "technical",
-      "prompt": "Describe how a transformer architecture processes input text step by step.",
-      "expected_keywords": [
-        "attention",
-        "embedding",
-        "encoder",
-        "decoder",
-        "token"
-      ],
-      "min_output_tokens": 80
-    },
-    {
-      "id": "technical_02",
-      "category": "technical",
-      "prompt": "What is quantization in the context of large language models, and why is it useful?",
-      "expected_keywords": [
-        "precision",
-        "memory",
-        "inference",
-        "bit",
-        "weight"
-      ],
-      "min_output_tokens": 60
-    },
-    {
-      "id": "reasoning_01",
-      "category": "reasoning",
-      "prompt": "A company has 100 employees. 60% work remotely, 30% work in-office, and the rest are hybrid. How many hybrid employees are there?",
-      "expected_keywords": ["10", "hybrid", "100"],
-      "min_output_tokens": 20
-    },
-    {
-      "id": "reasoning_02",
-      "category": "reasoning",
-      "prompt": "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
-      "expected_keywords": ["5", "minutes"],
-      "min_output_tokens": 20
-    },
-    {
-      "id": "creative_01",
-      "category": "creative",
-      "prompt": "Write a short poem about artificial intelligence and nature.",
-      "expected_keywords": ["AI", "nature", "learn"],
-      "min_output_tokens": 30
-    },
-    {
-      "id": "domain_01",
-      "category": "domain_specific",
-      "prompt": "What is QLoRA and how does it enable fine-tuning large language models on consumer GPUs?",
-      "expected_keywords": [
-        "quantization",
-        "LoRA",
-        "4-bit",
-        "VRAM",
-        "fine-tuning"
-      ],
-      "min_output_tokens": 60
-    },
-    {
-      "id": "domain_02",
-      "category": "domain_specific",
-      "prompt": "Explain the role of LoRA adapters in parameter-efficient fine-tuning.",
-      "expected_keywords": [
-        "low-rank",
-        "adapter",
-        "parameter",
-        "frozen",
-        "trainable"
-      ],
-      "min_output_tokens": 50
-    },
-    {
-      "id": "instruction_01",
-      "category": "instruction_following",
-      "prompt": "List exactly 5 benefits of using open-source LLMs over closed-source APIs. Number each benefit.",
-      "expected_keywords": ["1", "2", "3", "4", "5"],
-      "min_output_tokens": 50
-    }
-  ]
-}
+  {
+    "category": "General Knowledge",
+    "prompt": "Explain the theory of relativity in simple terms.",
+    "expected_keywords": ["Einstein", "speed of light", "time", "gravity"]
+  },
+  {
+    "category": "Domain Specific",
+    "prompt": "What are the primary benefits of using QLoRA for fine-tuning?",
+    "expected_keywords": ["quantization", "VRAM", "adapter", "4-bit"]
+  },
+  {
+    "category": "Reasoning",
+    "prompt": "If I have 3 apples and give away 2, but then find 4 more, how many do I have?",
+    "expected_keywords": ["5", "five"]
+  }
+]

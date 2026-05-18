@@ -69,7 +69,7 @@ def load_model_for_eval(base_model: str, adapter_path: Optional[str] = None):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -84,7 +84,7 @@ def load_model_for_eval(base_model: str, adapter_path: Optional[str] = None):
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     )
 
     if adapter_path and os.path.exists(adapter_path):
@@ -468,7 +468,7 @@ def vram_report() -> dict:
 
     allocated = torch.cuda.memory_allocated(0) / 1e9
     reserved = torch.cuda.memory_reserved(0) / 1e9
-    total = torch.cuda.get_device_properties(0).total_mem / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
     free = total - allocated
 
     report = {

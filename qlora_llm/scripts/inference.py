@@ -79,7 +79,7 @@ def load_model(base_model: str, adapter_path: Optional[str] = None, merge: bool 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -96,7 +96,7 @@ def load_model(base_model: str, adapter_path: Optional[str] = None, merge: bool 
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     )
 
     mem_used = torch.cuda.memory_allocated(0) / 1e9
@@ -279,7 +279,7 @@ def run_api(model, tokenizer, args):
         """Health check endpoint — returns GPU info and status."""
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU"
         vram_used = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
-        vram_total = torch.cuda.get_device_properties(0).total_mem / 1e9 if torch.cuda.is_available() else 0
+        vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
         return HealthResponse(
             status="ok",
             gpu=gpu_name,
